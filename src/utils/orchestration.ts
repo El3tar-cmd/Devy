@@ -349,6 +349,7 @@ function getFilesRevision(files: Record<string, string>) {
 }
 
 function getReviewerUserContext(input: string, currentFiles: Record<string, string>, plannerUsed: boolean, revision: string) {
+  const fileTree = Object.keys(currentFiles).sort().join('\n');
   return plannerUsed
     ? `Workspace revision: ${revision}
 
@@ -359,14 +360,20 @@ Approved plan artifacts:
 
 ${getPlanContext(currentFiles)}
 
-Generated files:
+File structure:
+${fileTree}
+
+Generated files content:
 ${JSON.stringify(currentFiles)}`
     : `Workspace revision: ${revision}
 
 User request:
 ${input}
 
-Current files snapshot:
+File structure:
+${fileTree}
+
+Current files snapshot content:
 ${JSON.stringify(currentFiles)}`;
 }
 
