@@ -155,18 +155,25 @@ function syncTaskChecklist(taskContent: string, baselineFiles: Record<string, st
     let changedCount = 0;
 
     for (const fileLine of block.fileLines) {
-      const completed = hasFileChanged(fileLine.path, baselineFiles, currentFiles);
+      const wasCompleted = lines[fileLine.index].includes('- [x]') || lines[fileLine.index].includes('- [X]');
+      const isCompletedNow = hasFileChanged(fileLine.path, baselineFiles, currentFiles);
+      const completed = wasCompleted || isCompletedNow;
+      
       if (completed) changedCount += 1;
       nextLines[fileLine.index] = `  - [${completed ? 'x' : ' '}] \`${fileLine.path}\``;
     }
 
     let taskMarker = ' ';
+    const wasTaskCompleted = lines[block.taskLineIndex].includes('- [x]') || lines[block.taskLineIndex].includes('- [X]');
+    
     if (block.fileLines.length > 0) {
       if (changedCount === block.fileLines.length) {
         taskMarker = 'x';
       } else if (changedCount > 0) {
         taskMarker = '~';
       }
+    } else if (wasTaskCompleted) {
+      taskMarker = 'x';
     }
 
     nextLines[block.taskLineIndex] = `- [${taskMarker}] ${block.title}`;
@@ -245,11 +252,14 @@ function getExecutionMode(isMultiAgentEnabled: boolean): ExecutionMode {
   return isMultiAgentEnabled ? 'multi-agent' : 'single-agent';
 }
 
-const SHARED_AGENT_RULES = `Use <file> and <edit> tags only. Never answer with markdown code fences. Prefer minimal, targeted edits when changing existing projects. Preserve unrelated working files unless a directly related change is required.`;
+const SHARED_AGENT_RULES = `Use <file> and <edit> tags only. Never answer with markdown code fences. 
+CRITICAL: For existing files, you MUST use <edit> tags. Do NOT use <file> tags for existing files, as it will overwrite the entire file and delete unrelated code.
+Use <file> tags ONLY for creating completely new files.
+Prefer minimal, targeted edits when changing existing projects. Preserve unrelated working files unless a directly related change is required.`;
 
 function getExecutionAgentPrompt(spec: BuildSpec, executionMode: ExecutionMode, workflow: WorkflowKind, plannerUsed: boolean, agentName: string = 'Builder') {
   const modeInstructions = plannerUsed
-    ? 'The approved planning artifacts are the source of truth. Follow them closely, but still preserve unrelated working files.'
+    ? 'The approved planning artifacts (`plan.md`, `structure.md`, `task.md`) are your CONSTITUTION. You MUST strictly follow them. CRITICAL: DO NOT create any files that are not explicitly listed in `structure.md` or `task.md`. DO NOT improvise or add extra features not requested in the plan. If a file is not in your assigned task, DO NOT touch it.'
     : workflow === 'fix'
       ? 'Repair the existing project directly from the prompt and current project snapshot. Preserve unrelated working files and avoid broad rewrites.'
       : workflow === 'rebuild'
@@ -291,14 +301,7 @@ You are the Reviewer Agent. ${scopeInstructions} Prioritize runtime and build bl
 Return valid JSON only. Do not emit markdown, headings, or <file>/<edit> blocks in this phase.
 
 Project intent: ${spec.projectIntent}
-Target surface: ${spec.targetSurface}
-${SHARED_AGENT_RULES.replace('Use <file> and <edit> tags only. ', '')}`;
-}
-
-function getFixerPrompt(spec: BuildSpec) {
-  return `${SYSTEM_PROMPT}
-
-You are the Fixer Agent. Repair only the failures reported by the quality gates and reviewer. Prioritize runtime/build/import blockers before plan compliance or quality polish. Default to ${spec.repairStrategy} edits and avoid broad rewrites unless the failing scope is structurally broken. ${SHARED_AGENT_RULES}`;
+Target surface: ${spec.targetSurface}`;
 }
 
 function getSingleAgentUserContext(input: string, currentFiles: Record<string, string>) {
@@ -445,7 +448,7 @@ function createParserFailureGates(diagnostics: ParserDiagnostics, phase: 'builde
       title: `${phase === 'builder' ? 'Builder' : 'Fixer'} emitted unapplied edits`,
       message: `One or more <edit> operations could not be applied cleanly. Affected files: ${diagnostics.failedEditFiles.join(', ')}.`,
       affectedFiles: diagnostics.failedEditFiles,
-      autoFixHint: 'Re-emit concrete edits with exact search snippets from the current files or overwrite only the failing file when necessary.',
+      autoFixHint: 'CRITICAL: Your previous <edit> failed because the <search> block did not EXACTLY match the file content. You MUST copy the exact lines from the current file snapshot, including all whitespace and indentation. Do NOT use <file> tags to overwrite existing files.',
     },
   ];
 }
@@ -779,15 +782,20 @@ export async function generateProjectWithOrchestration({
   let currentFiles = { ...existingFiles };
   const searchContext = await runSearchIfNeeded(endpoint, selectedModel, input, isWebSearchEnabled);
 
-  onStatusUpdate({ phase: 'routing', agent: 'lead', searching: 'Lead Agent is selecting the right workflow...' });
-  const routingDecision = await routeRequestWithLeadAgent({
-    endpoint,
-    selectedModel,
-    input,
-    currentFiles,
-    executionMode,
-    signal,
-  });
+  let routingDecision;
+  if (executionMode === 'multi-agent') {
+    onStatusUpdate({ phase: 'routing', agent: 'lead', searching: 'Lead Agent is selecting the right workflow...' });
+    routingDecision = await routeRequestWithLeadAgent({
+      endpoint,
+      selectedModel,
+      input,
+      currentFiles,
+      executionMode,
+      signal,
+    });
+  } else {
+    routingDecision = inferRoutingDecision(input, currentFiles, executionMode);
+  }
 
   const workflow = routingDecision.workflow;
   const plannerUsed = executionMode === 'multi-agent' && routingDecision.needsPlanner;
@@ -821,6 +829,10 @@ You are the Planner Agent. Before any implementation starts, create exactly thre
 2. structure.md
 3. task.md
 
+CRITICAL: DO NOT CREATE ANY OTHER FILES. You are ONLY allowed to create these three planning files. Do not write any code for the actual application.
+
+Make your plan EXTREMELY detailed, robust, and comprehensive. Do not make weak or brief plans. Include all necessary components, utilities, configurations, and styling files. The execution agents will strictly follow your plan, so if you miss a file, it will not be built.
+
 plan.md must contain these headings exactly:
 # Implementation Plan
 ## App Kind
@@ -838,7 +850,7 @@ task.md must contain these headings exactly:
 # Task List
 ## Execution Steps
 
-Inside task.md, write at least 3 top-level tasks using this exact pattern:
+Inside task.md, write comprehensive and detailed top-level tasks using this exact pattern:
 - [ ] Task title
   Assigned Agent: [Agent Name]
   Files:
@@ -909,18 +921,21 @@ Every implementation file listed in structure.md must appear under exactly one t
 
     if (plannerUsed) {
       const taskContent = currentFiles['task.md'] || '';
-      const { blocks } = parseTaskBlocks(taskContent);
+      const { blocks, lines } = parseTaskBlocks(taskContent);
 
       for (const block of blocks) {
-        // Check if task is already completed based on file changes
+        // Check if task is already completed based on task.md markers
+        const isTaskMarkedCompleted = lines[block.taskLineIndex] && (lines[block.taskLineIndex].includes('- [x]') || lines[block.taskLineIndex].includes('- [X]'));
+        
         let changedCount = 0;
         for (const fileLine of block.fileLines) {
-          if (hasFileChanged(fileLine.path, executionBaselineFiles, currentFiles)) {
+          const isFileMarkedCompleted = lines[fileLine.index] && (lines[fileLine.index].includes('- [x]') || lines[fileLine.index].includes('- [X]'));
+          if (isFileMarkedCompleted || hasFileChanged(fileLine.path, executionBaselineFiles, currentFiles)) {
             changedCount += 1;
           }
         }
         
-        if (block.fileLines.length > 0 && changedCount === block.fileLines.length) {
+        if (isTaskMarkedCompleted || (block.fileLines.length > 0 && changedCount === block.fileLines.length)) {
           continue; // Task already completed
         }
 
@@ -970,6 +985,16 @@ ${getMultiAgentUserContext(currentFiles)}`,
         });
 
         currentFiles = syncTaskFile(executionResult.files, executionBaselineFiles);
+        
+        // Manually mark task as completed if it has no files, since syncTaskFile can't detect changes
+        if (block.fileLines.length === 0 && currentFiles['task.md']) {
+          const lines = currentFiles['task.md'].split('\n');
+          if (lines[block.taskLineIndex] && lines[block.taskLineIndex].includes('- [ ]')) {
+            lines[block.taskLineIndex] = lines[block.taskLineIndex].replace('- [ ]', '- [x]');
+            currentFiles['task.md'] = lines.join('\n');
+          }
+        }
+        
         onFilesUpdate(currentFiles);
         
         // Merge diagnostics

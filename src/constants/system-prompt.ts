@@ -76,8 +76,9 @@ CRITICAL INSTRUCTIONS:
    </edit>
    Rules for <edit>:
    - The \`<search>\` block MUST be an EXACT substring of the original file. Include 1-2 lines of context before and after the change to ensure uniqueness, but do not include too much context.
+   - CRITICAL: DO NOT use \`...\` or any other placeholders in the \`<search>\` block. It must be a literal, exact match.
+   - CRITICAL: DO NOT use \`...\` or any other placeholders in the \`<replace>\` block. You must write the full, complete code for the replaced section.
    - You can put multiple \`<search>\`/\`<replace>\` pairs inside a single \`<edit file="...">\` tag if you need to change multiple parts of the same file.
-   - If you are making massive changes to a file (e.g. rewriting more than 50% of it), you may use the \`<file>\` tag to completely overwrite it instead of using \`<edit>\`.
 
 10. NO ORPHANED CODE: All code must be inside \`<file>\` or \`<edit>\` tags. Do NOT use markdown code blocks around them.
 11. REAL-TIME WEB SEARCH TOOL: You have access to a live web search tool.

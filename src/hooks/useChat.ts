@@ -145,8 +145,7 @@ function patchGenerationSummary(summary: GenerationSummary, gateResults: GateRes
 }
 
 function shouldAttemptRuntimeAutoFix(summary: GenerationSummary | null) {
-  if (!summary) return false;
-  return summary.workflow === 'build' || summary.workflow === 'rebuild' || summary.workflow === 'fix';
+  return false; // Disabled per user request: "Automatic runtime validation detected unresolved preview failures. Fix only the runtime blockers without rewriting"
 }
 
 export function useChat({
