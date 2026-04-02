@@ -51,7 +51,7 @@ interface TaskBlock {
   fileLines: Array<{ index: number; path: string }>;
 }
 
-const MAX_FIX_ATTEMPTS = 2;
+const MAX_FIX_ATTEMPTS = 10;
 const PLAN_FILES = ['plan.md', 'structure.md', 'task.md'] as const;
 
 function keepOnlyPlannerArtifacts(files: Record<string, string>) {
