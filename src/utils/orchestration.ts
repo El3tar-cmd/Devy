@@ -1,0 +1,1211 @@
+import { streamOllamaChat } from '../lib/ollama';
+import { parseFilesFromStream, type ParserDiagnostics } from './file-parser';
+import { SearchService } from '../services/SearchService';
+import { SYSTEM_PROMPT } from '../constants/system-prompt';
+import { buildSpecFromPrompt } from './project-classifier';
+import { getFailedGateSummary, runQualityGates, summarizeGateResults } from './quality-gates';
+import type {
+  BuildSpec,
+  ExecutionMode,
+  GateResult,
+  GenerationAgent,
+  GenerationPhase,
+  GenerationSummary,
+  ReviewerFinding,
+  ReviewerReport,
+  RoutingDecision,
+  WorkflowKind,
+} from '../types';
+import type { OllamaMessage } from '../lib/ollama';
+
+interface GenerateProjectOptions {
+  endpoint: string;
+  selectedModel: string;
+  input: string;
+  existingMessages: OllamaMessage[];
+  existingFiles: Record<string, string>;
+  isWebSearchEnabled: boolean;
+  isMultiAgentEnabled: boolean;
+  signal?: AbortSignal;
+  onMessagesUpdate: (messages: OllamaMessage[]) => void;
+  onFilesUpdate: (files: Record<string, string>) => void;
+  onStatusUpdate: (status: {
+    phase: GenerationPhase;
+    agent: GenerationAgent;
+    searching: string | boolean;
+  }) => void;
+}
+
+interface GenerateProjectResult {
+  messages: OllamaMessage[];
+  files: Record<string, string>;
+  gateResults: GateResult[];
+  summary: GenerationSummary;
+  buildSpec: BuildSpec;
+}
+
+interface TaskBlock {
+  taskLineIndex: number;
+  title: string;
+  fileLines: Array<{ index: number; path: string }>;
+}
+
+const MAX_FIX_ATTEMPTS = 2;
+const PLAN_FILES = ['implementation.md', 'structure.md', 'task.md'] as const;
+
+function keepOnlyPlannerArtifacts(files: Record<string, string>) {
+  return Object.fromEntries(
+    PLAN_FILES.filter((file) => file in files).map((file) => [file, files[file]])
+  ) as Record<string, string>;
+}
+
+function mergePlannerArtifacts(baseFiles: Record<string, string>, plannerFiles: Record<string, string>) {
+  return {
+    ...baseFiles,
+    ...keepOnlyPlannerArtifacts(plannerFiles),
+  };
+}
+
+function hasClosedPlannerArtifact(rawText: string, path: string) {
+  const openTag = `<file path="${path}">`;
+  const openIndex = rawText.indexOf(openTag);
+  if (openIndex === -1) return false;
+
+  return rawText.indexOf('</file>', openIndex + openTag.length) !== -1;
+}
+
+function shouldStopPlannerStream(rawText: string, files: Record<string, string>) {
+  return PLAN_FILES.every((file) => file in files && hasClosedPlannerArtifact(rawText, file));
+}
+
+function getPlannerSummary(files: Record<string, string>) {
+  const created = PLAN_FILES.filter((file) => file in files);
+  if (created.length === PLAN_FILES.length) {
+    return `**[Planner Agent]**\n\nCreated plan artifacts: ${created.join(', ')}`;
+  }
+  return '**[Planner Agent]**\n\nPreparing plan artifacts...';
+}
+
+function getPlanContext(files: Record<string, string>) {
+  return [
+    `implementation.md:\n${files['implementation.md'] || 'Missing'}`,
+    `structure.md:\n${files['structure.md'] || 'Missing'}`,
+    `task.md:\n${files['task.md'] || 'Missing'}`,
+  ].join('\n\n');
+}
+
+function isTaskLine(line: string) {
+  return /^- \[[ xX~]\] /.test(line.trim());
+}
+
+function isHeadingLine(line: string) {
+  return /^#{1,6}\s/.test(line.trim());
+}
+
+function parseTaskBlocks(taskContent: string) {
+  const lines = taskContent.split('\n');
+  const blocks: TaskBlock[] = [];
+
+  for (let i = 0; i < lines.length; i += 1) {
+    const match = lines[i].match(/^- \[[ xX~]\] (.+)$/);
+    if (!match) continue;
+
+    const block: TaskBlock = {
+      taskLineIndex: i,
+      title: match[1].trim(),
+      fileLines: [],
+    };
+
+    for (let j = i + 1; j < lines.length; j += 1) {
+      const line = lines[j];
+      if (isTaskLine(line) || isHeadingLine(line)) break;
+
+      const fileMatch = line.match(/^\s*- \[[ xX~]\] `([^`]+)`/);
+      if (fileMatch) {
+        block.fileLines.push({ index: j, path: fileMatch[1] });
+      }
+    }
+
+    blocks.push(block);
+  }
+
+  return { lines, blocks };
+}
+
+function hasFileChanged(path: string, baselineFiles: Record<string, string>, currentFiles: Record<string, string>) {
+  if (!(path in currentFiles)) return false;
+  return baselineFiles[path] !== currentFiles[path];
+}
+
+function syncTaskChecklist(taskContent: string, baselineFiles: Record<string, string>, currentFiles: Record<string, string>) {
+  if (!taskContent.trim()) return taskContent;
+
+  const { lines, blocks } = parseTaskBlocks(taskContent);
+  if (blocks.length === 0) return taskContent;
+
+  const nextLines = [...lines];
+
+  for (const block of blocks) {
+    let changedCount = 0;
+
+    for (const fileLine of block.fileLines) {
+      const completed = hasFileChanged(fileLine.path, baselineFiles, currentFiles);
+      if (completed) changedCount += 1;
+      nextLines[fileLine.index] = `  - [${completed ? 'x' : ' '}] \`${fileLine.path}\``;
+    }
+
+    let taskMarker = ' ';
+    if (block.fileLines.length > 0) {
+      if (changedCount === block.fileLines.length) {
+        taskMarker = 'x';
+      } else if (changedCount > 0) {
+        taskMarker = '~';
+      }
+    }
+
+    nextLines[block.taskLineIndex] = `- [${taskMarker}] ${block.title}`;
+  }
+
+  return nextLines.join('\n');
+}
+
+function getChangedFiles(previousFiles: Record<string, string>, nextFiles: Record<string, string>) {
+  return Object.keys(nextFiles).filter((file) => !(file in previousFiles) || previousFiles[file] !== nextFiles[file]);
+}
+
+function createNoOpFixerGate(attemptCount: number): GateResult {
+  return {
+    id: `fixer-noop-${attemptCount}`,
+    status: 'fail',
+    priority: 'blocker',
+    scope: 'universal',
+    title: 'Fixer produced no file changes',
+    message: 'The fixer response did not apply any real file edits while critical gates were still failing.',
+    affectedFiles: ['task.md'],
+    autoFixHint: 'Apply concrete <file> or <edit> changes that resolve the failing code or structure issues.',
+  };
+}
+
+const PLAN_ARTIFACT_SET = new Set<string>(PLAN_FILES);
+
+function getFailedGateAffectedFiles(gateResults: GateResult[]) {
+  return Array.from(
+    new Set(
+      gateResults
+        .filter((gate) => gate.status === 'fail')
+        .flatMap((gate) => gate.affectedFiles)
+        .filter(Boolean)
+    )
+  );
+}
+
+function getNonPlanChangedFiles(previousFiles: Record<string, string>, nextFiles: Record<string, string>) {
+  return getChangedFiles(previousFiles, nextFiles).filter((file) => !PLAN_ARTIFACT_SET.has(file));
+}
+
+function hasNonPlanFailures(gateResults: GateResult[]) {
+  return gateResults.some(
+    (gate) => gate.status === 'fail' && gate.affectedFiles.some((file) => !PLAN_ARTIFACT_SET.has(file))
+  );
+}
+
+function createPaperworkOnlyFixerGate(attemptCount: number, changedFiles: string[]): GateResult {
+  return {
+    id: `fixer-paperwork-only-${attemptCount}`,
+    status: 'fail',
+    priority: 'blocker',
+    scope: 'universal',
+    title: 'Fixer only changed planning artifacts',
+    message: `The fixer edited only planning files (${changedFiles.join(', ')}) while executable failures were still present.`,
+    affectedFiles: [...PLAN_FILES],
+    autoFixHint: 'Limit the fixer to the failing implementation files and apply concrete code or config changes first.',
+  };
+}
+
+function syncTaskFile(files: Record<string, string>, baselineFiles: Record<string, string>) {
+  const taskContent = files['task.md'] || '';
+  const nextTaskContent = syncTaskChecklist(taskContent, baselineFiles, files);
+  if (!nextTaskContent || nextTaskContent === taskContent) {
+    return files;
+  }
+
+  return {
+    ...files,
+    'task.md': nextTaskContent,
+  };
+}
+
+function getExecutionMode(isMultiAgentEnabled: boolean): ExecutionMode {
+  return isMultiAgentEnabled ? 'multi-agent' : 'single-agent';
+}
+
+const SHARED_AGENT_RULES = `Use <file> and <edit> tags only. Never answer with markdown code fences. Prefer minimal, targeted edits when changing existing projects. Preserve unrelated working files unless a directly related change is required.`;
+
+function getBuilderPrompt(spec: BuildSpec, executionMode: ExecutionMode, workflow: WorkflowKind, plannerUsed: boolean) {
+  const modeInstructions = plannerUsed
+    ? 'The approved planning artifacts are the source of truth. Follow them closely, but still preserve unrelated working files.'
+    : workflow === 'fix'
+      ? 'Repair the existing project directly from the prompt and current project snapshot. Preserve unrelated working files and avoid broad rewrites.'
+      : workflow === 'rebuild'
+        ? 'Rebuild the requested project cleanly from the prompt and current snapshot, replacing only the scope required by the request.'
+        : 'Implement the user request directly from the prompt and current project snapshot without inventing planning artifacts.';
+
+  return `${SYSTEM_PROMPT}
+
+You are the Builder Agent. ${modeInstructions}
+
+Execution mode: ${executionMode}
+Workflow: ${workflow}
+Project intent: ${spec.projectIntent}
+Target surface: ${spec.targetSurface}
+Repair strategy: ${spec.repairStrategy}
+App kind: ${spec.appKind}
+UI style: ${spec.uiStyle}
+Features: ${spec.featureSet.join(', ') || 'standard'}
+Acceptance checks: ${spec.acceptanceChecks.join('; ')}
+
+${SHARED_AGENT_RULES}`;
+}
+
+function getReviewerPrompt(spec: BuildSpec, plannerUsed: boolean) {
+  const scopeInstructions = plannerUsed
+    ? 'Review the generated result against implementation.md, structure.md, and task.md.'
+    : 'Review the current project against the user request and the existing files only. Do not ask for planning artifacts and do not assume they should exist.';
+
+  return `${SYSTEM_PROMPT}
+
+You are the Reviewer Agent. ${scopeInstructions} Prioritize runtime and build blockers first, then plan compliance, then maintainability issues. Output JSON only with this exact shape:
+{
+  "runtimeBlockers": [{ "title": string, "message": string, "affectedFiles": string[] }],
+  "buildBlockers": [{ "title": string, "message": string, "affectedFiles": string[] }],
+  "complianceFailures": [{ "title": string, "message": string, "affectedFiles": string[] }],
+  "qualityWarnings": [{ "title": string, "message": string, "affectedFiles": string[] }],
+  "verdict": string
+}
+Return valid JSON only. Do not emit markdown, headings, or <file>/<edit> blocks in this phase.
+
+Project intent: ${spec.projectIntent}
+Target surface: ${spec.targetSurface}
+${SHARED_AGENT_RULES.replace('Use <file> and <edit> tags only. ', '')}`;
+}
+
+function getFixerPrompt(spec: BuildSpec) {
+  return `${SYSTEM_PROMPT}
+
+You are the Fixer Agent. Repair only the failures reported by the quality gates and reviewer. Prioritize runtime/build/import blockers before plan compliance or quality polish. Default to ${spec.repairStrategy} edits and avoid broad rewrites unless the failing scope is structurally broken. ${SHARED_AGENT_RULES}`;
+}
+
+function getSingleAgentUserContext(input: string, currentFiles: Record<string, string>) {
+  return `User request:
+${input}
+
+Current files snapshot:
+${JSON.stringify(currentFiles)}`;
+}
+
+function getMultiAgentUserContext(currentFiles: Record<string, string>) {
+  return `Approved plan artifacts:
+
+${getPlanContext(currentFiles)}
+
+Current files snapshot:
+${JSON.stringify(currentFiles)}
+
+IMPORTANT: Complete the task.md file checklist by implementing the referenced files. Preserve task.md structure so the orchestrator can mark file completion automatically.`;
+}
+
+function getFixUserContext(input: string, currentFiles: Record<string, string>) {
+  return `User request:
+${input}
+
+Fix the existing project with the smallest concrete edit set needed. Preserve unrelated working files.
+
+Current files snapshot:
+${JSON.stringify(currentFiles)}`;
+}
+
+function getFilesRevision(files: Record<string, string>) {
+  const entries = Object.entries(files).sort(([left], [right]) => left.localeCompare(right));
+  let hash = 2166136261;
+
+  for (const [path, content] of entries) {
+    const value = `${path}\0${content}\u0001`;
+    for (let index = 0; index < value.length; index += 1) {
+      hash ^= value.charCodeAt(index);
+      hash = Math.imul(hash, 16777619);
+    }
+  }
+
+  return `r${(hash >>> 0).toString(36)}-${entries.length}`;
+}
+
+function getReviewerUserContext(input: string, currentFiles: Record<string, string>, plannerUsed: boolean, revision: string) {
+  return plannerUsed
+    ? `Workspace revision: ${revision}
+
+User request:
+${input}
+
+Approved plan artifacts:
+
+${getPlanContext(currentFiles)}
+
+Generated files:
+${JSON.stringify(currentFiles)}`
+    : `Workspace revision: ${revision}
+
+User request:
+${input}
+
+Current files snapshot:
+${JSON.stringify(currentFiles)}`;
+}
+
+function createEmptyReviewerReport(): ReviewerReport {
+  return {
+    runtimeBlockers: [],
+    buildBlockers: [],
+    complianceFailures: [],
+    qualityWarnings: [],
+    verdict: '',
+  };
+}
+
+function normalizeReviewerFindings(value: unknown): ReviewerFinding[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item) => {
+      if (!item || typeof item !== 'object') return null;
+      const finding = item as Record<string, unknown>;
+      return {
+        title: typeof finding.title === 'string' ? finding.title.trim() : '',
+        message: typeof finding.message === 'string' ? finding.message.trim() : '',
+        affectedFiles: Array.isArray(finding.affectedFiles) ? finding.affectedFiles.filter((file): file is string => typeof file === 'string') : [],
+      } satisfies ReviewerFinding;
+    })
+    .filter((finding): finding is ReviewerFinding => Boolean(finding && finding.title && finding.message));
+}
+
+function parseReviewerReport(cleanText: string): ReviewerReport | null {
+  const jsonText = cleanText.match(/\{[\s\S]*\}/)?.[0];
+  if (!jsonText) return null;
+
+  try {
+    const parsed = JSON.parse(jsonText) as Record<string, unknown>;
+    return {
+      runtimeBlockers: normalizeReviewerFindings(parsed.runtimeBlockers),
+      buildBlockers: normalizeReviewerFindings(parsed.buildBlockers),
+      complianceFailures: normalizeReviewerFindings(parsed.complianceFailures),
+      qualityWarnings: normalizeReviewerFindings(parsed.qualityWarnings),
+      verdict: typeof parsed.verdict === 'string' ? parsed.verdict.trim() : '',
+    };
+  } catch (_error) {
+    return null;
+  }
+}
+
+function formatReviewerReport(report: ReviewerReport) {
+  const formatSection = (title: string, findings: ReviewerFinding[]) => {
+    if (findings.length === 0) return `${title}
+- none`;
+    return `${title}
+${findings.map((finding) => `- ${finding.title}: ${finding.message}`).join('\n')}`;
+  };
+
+  return [
+    '**[Reviewer Agent]**',
+    '',
+    formatSection('Runtime Blockers', report.runtimeBlockers),
+    '',
+    formatSection('Build Blockers', report.buildBlockers),
+    '',
+    formatSection('Compliance Gaps', report.complianceFailures),
+    '',
+    formatSection('Quality Notes', report.qualityWarnings),
+    '',
+    `Verdict\n${report.verdict || 'No verdict provided.'}`,
+  ].join('\n');
+}
+
+function createParserFailureGates(diagnostics: ParserDiagnostics, phase: 'builder' | 'fixer'): GateResult[] {
+  if (diagnostics.failedEditCount === 0) return [];
+
+  return [
+    {
+      id: `${phase}-edit-application-failed`,
+      status: 'fail',
+      priority: 'blocker',
+      scope: 'universal',
+      title: `${phase === 'builder' ? 'Builder' : 'Fixer'} emitted unapplied edits`,
+      message: `One or more <edit> operations could not be applied cleanly. Affected files: ${diagnostics.failedEditFiles.join(', ')}.`,
+      affectedFiles: diagnostics.failedEditFiles,
+      autoFixHint: 'Re-emit concrete edits with exact search snippets from the current files or overwrite only the failing file when necessary.',
+    },
+  ];
+}
+
+function dedupeGateResults(gateResults: GateResult[]) {
+  const seen = new Set<string>();
+  return gateResults.filter((gate) => {
+    const key = `${gate.id}:${gate.title}:${gate.status}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+async function runExecutionGates(
+  files: Record<string, string>,
+  spec: BuildSpec,
+  executionMode: ExecutionMode,
+  diagnostics: ParserDiagnostics,
+  phase: 'builder' | 'fixer',
+  requirePlanArtifacts = executionMode === 'multi-agent'
+) {
+  return dedupeGateResults([
+    ...createParserFailureGates(diagnostics, phase),
+    ...(await runQualityGates(files, spec, { executionMode, requirePlanArtifacts })),
+  ]);
+}
+
+function hasBlockingFailures(gateResults: GateResult[]) {
+  return gateResults.some((gate) => gate.status === 'fail' && gate.priority === 'blocker');
+}
+
+function extractReviewerSection(summary: string, heading: string, nextHeading: string[]) {
+  const lines = summary.split(/\r?\n/);
+  const startIndex = lines.findIndex((line) => line.trim().toLowerCase() === heading.toLowerCase());
+  if (startIndex === -1) return '';
+
+  const collected: string[] = [];
+  for (let index = startIndex + 1; index < lines.length; index += 1) {
+    const line = lines[index];
+    if (nextHeading.some((candidate) => line.trim().toLowerCase() === candidate.toLowerCase())) {
+      break;
+    }
+    collected.push(line);
+  }
+
+  return collected.join('\n').trim();
+}
+
+function isMeaningfulReviewerSection(section: string) {
+  if (!section) return false;
+  const normalized = section.toLowerCase();
+  return !['none', 'n/a', 'no issues', 'no blockers', 'no gaps', 'no critical runtime blockers found.'].includes(normalized);
+}
+
+function createReviewerDerivedGates(reviewerReport: ReviewerReport): GateResult[] {
+  const gates: GateResult[] = [];
+
+  for (const finding of [...reviewerReport.runtimeBlockers, ...reviewerReport.buildBlockers]) {
+    gates.push({
+      id: `reviewer-runtime-${finding.title.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`,
+      status: 'fail',
+      priority: 'blocker',
+      scope: 'universal',
+      title: finding.title,
+      message: finding.message,
+      affectedFiles: finding.affectedFiles,
+      autoFixHint: 'Address the reviewer-reported runtime/build blocker before accepting the project.',
+    });
+  }
+
+  for (const finding of reviewerReport.complianceFailures) {
+    gates.push({
+      id: `reviewer-compliance-${finding.title.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`,
+      status: 'fail',
+      priority: 'compliance',
+      scope: 'universal',
+      title: finding.title,
+      message: finding.message,
+      affectedFiles: finding.affectedFiles,
+      autoFixHint: 'Bring the generated files back in line with the requested structure and reviewer findings.',
+    });
+  }
+
+  return gates;
+}
+
+function hasExistingProjectFiles(files: Record<string, string>) {
+  return Object.keys(files).some((file) => !PLAN_ARTIFACT_SET.has(file));
+}
+
+function inferRoutingDecision(input: string, existingFiles: Record<string, string>, executionMode: ExecutionMode): RoutingDecision {
+  const normalized = input.toLowerCase();
+  const hasProject = hasExistingProjectFiles(existingFiles);
+  const wantsRebuild = /(from scratch|start over|rebuild|regenerate|rewrite everything|ابدأ من جديد|اعادة بناء|إعادة بناء)/i.test(input);
+  const wantsInspectOnly = /(inspect only|review only|audit only|فحص فقط|راجع فقط|بدون تعديل|without changes?)/i.test(input);
+  const wantsReview = /(افحص|فحص|راجع|مراجعة|دقق|audit|inspect|review|analy[sz]e|diagnos|quality check|code review)/i.test(input);
+  const wantsFix = /(اصلح|إصلح|اصلاح|إصلاح|تصليح|حل|لا يعمل|لا تعمل|مش شغال|مش شغالة|لا يشتغل|لا تشتغل|مش بيشتغل|does not work|doesn't work|not working|broken|fix|repair|resolve|debug|bug|errors?|issues?)/i.test(input);
+
+  let workflow: WorkflowKind = 'build';
+
+  if (wantsRebuild) {
+    workflow = 'rebuild';
+  } else if (hasProject && wantsInspectOnly) {
+    workflow = 'inspect';
+  } else if (hasProject && wantsReview && !wantsFix) {
+    workflow = 'review';
+  } else if (hasProject && wantsFix) {
+    workflow = 'fix';
+  }
+
+  if (!hasProject && (workflow === 'review' || workflow === 'inspect' || workflow === 'fix')) {
+    workflow = 'build';
+  }
+
+  const needsPlanner = executionMode === 'multi-agent' && (workflow === 'build' || workflow === 'rebuild');
+  const targetAgent: GenerationAgent = workflow === 'build' || workflow === 'rebuild'
+    ? needsPlanner ? 'planner' : 'builder'
+    : workflow === 'fix'
+      ? executionMode === 'multi-agent' ? 'reviewer' : 'builder'
+      : executionMode === 'multi-agent' ? 'reviewer' : null;
+
+  const reason = workflow === 'build' || workflow === 'rebuild'
+    ? hasProject && normalized.includes('rebuild') ? 'Existing project requires a rebuild workflow.' : 'Request is primarily asking for implementation work.'
+    : workflow === 'fix'
+      ? 'Existing project files are present and the request is asking for targeted fixes.'
+      : 'Existing project files are present and the request is asking for inspection or review.';
+
+  return {
+    workflow,
+    needsPlanner,
+    targetAgent,
+    shouldPreserveFiles: workflow !== 'rebuild',
+    reason,
+  };
+}
+
+function normalizeRoutingDecision(candidate: Partial<RoutingDecision>, fallback: RoutingDecision, executionMode: ExecutionMode, existingFiles: Record<string, string>): RoutingDecision {
+  const allowedWorkflows: WorkflowKind[] = ['build', 'review', 'fix', 'inspect', 'rebuild'];
+  let workflow = allowedWorkflows.includes(candidate.workflow as WorkflowKind) ? candidate.workflow as WorkflowKind : fallback.workflow;
+  const hasProject = hasExistingProjectFiles(existingFiles);
+
+  // When the deterministic fallback sees a fix request on an existing project, do not allow the model to reroute it into review/inspect/build planning.
+  if (fallback.workflow === 'fix' && (workflow === 'review' || workflow === 'inspect' || workflow === 'build' || workflow === 'rebuild')) {
+    workflow = 'fix';
+  }
+
+  if (!hasProject && (workflow === 'review' || workflow === 'inspect' || workflow === 'fix')) {
+    workflow = 'build';
+  }
+
+  const needsPlanner = executionMode === 'multi-agent' && (candidate.needsPlanner ?? fallback.needsPlanner) && (workflow === 'build' || workflow === 'rebuild');
+  const targetAgent = workflow === 'build' || workflow === 'rebuild'
+    ? needsPlanner ? 'planner' : 'builder'
+    : workflow === 'fix'
+      ? executionMode === 'multi-agent' ? 'reviewer' : 'builder'
+      : executionMode === 'multi-agent' ? 'reviewer' : null;
+
+  return {
+    workflow,
+    needsPlanner,
+    targetAgent,
+    shouldPreserveFiles: typeof candidate.shouldPreserveFiles === 'boolean' ? candidate.shouldPreserveFiles : workflow !== 'rebuild',
+    reason: typeof candidate.reason === 'string' && candidate.reason.trim() ? candidate.reason.trim() : fallback.reason,
+  };
+}
+
+async function routeRequestWithLeadAgent(params: {
+  endpoint: string;
+  selectedModel: string;
+  input: string;
+  currentFiles: Record<string, string>;
+  executionMode: ExecutionMode;
+  signal?: AbortSignal;
+}) {
+  const fallback = inferRoutingDecision(params.input, params.currentFiles, params.executionMode);
+
+  try {
+    const response = await fetch(`${params.endpoint.replace(/\/$/, '')}/api/generate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: params.selectedModel,
+        prompt: `You are the Lead Agent for an app-building workflow. Decide the workflow for the request. Output JSON only with keys workflow, needsPlanner, targetAgent, shouldPreserveFiles, reason.\n\nAllowed workflow values: build, review, fix, inspect, rebuild.\nAllowed targetAgent values: planner, builder, reviewer, fixer, lead, null.\nRules:\n- review/inspect/fix must not request planning artifacts unless a rebuild is explicitly needed.\n- build/rebuild may use planner only in multi-agent mode.\n- If the project already exists and the user asks to inspect, review, diagnose, or audit it, choose review or inspect.\n- If the project already exists and the user asks to fix errors, choose fix.\n- If the user asks to start over or rebuild, choose rebuild.\n\nExecution mode: ${params.executionMode}\nUser request:\n${params.input}\n\nCurrent file paths:\n${Object.keys(params.currentFiles).sort().slice(0, 200).join('\n') || '(none)'}`,
+        stream: false,
+        format: 'json',
+        options: { temperature: 0.1, num_predict: 160 },
+      }),
+      signal: params.signal,
+    });
+
+    if (!response.ok) {
+      return fallback;
+    }
+
+    const data = await response.json();
+    const raw = typeof data.response === 'string' ? data.response : '';
+    const jsonText = raw.match(/\{[\s\S]*\}/)?.[0];
+    if (!jsonText) {
+      return fallback;
+    }
+
+    const parsed = JSON.parse(jsonText) as Partial<RoutingDecision>;
+    return normalizeRoutingDecision(parsed, fallback, params.executionMode, params.currentFiles);
+  } catch (_error) {
+    return fallback;
+  }
+}
+
+async function runSearchIfNeeded(endpoint: string, selectedModel: string, input: string, enabled: boolean) {
+  if (!enabled) return '';
+
+  let optimizedQuery = input;
+
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 5000);
+
+    const response = await fetch(`${endpoint.replace(/\/$/, '')}/api/generate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: selectedModel,
+        prompt: `Convert the following user request into a concise web search query. Output only the query.\n\n${input}`,
+        stream: false,
+        options: { temperature: 0.1, num_predict: 50 },
+      }),
+      signal: controller.signal,
+    });
+
+    clearTimeout(timeoutId);
+
+    if (response.ok) {
+      const data = await response.json();
+      if (typeof data.response === 'string' && data.response.trim().length > 2) {
+        optimizedQuery = data.response.trim().replace(/^["']|["']$/g, '');
+      }
+    }
+  } catch (_error) {
+    // Keep original input when optimization fails.
+  }
+
+  try {
+    return await SearchService.searchWeb(optimizedQuery);
+  } catch (_error) {
+    return '\n--- WEB SEARCH ERROR ---\nCould not retrieve live data. Proceeding with internal knowledge.\n';
+  }
+}
+
+async function streamSingleAgent(params: {
+  endpoint: string;
+  model: string;
+  messages: OllamaMessage[];
+  signal?: AbortSignal;
+  baselineFiles: Record<string, string>;
+  messagePrefix?: string;
+  shouldStop?: (
+    text: string,
+    generatedFiles: Record<string, string>,
+    cleanText: string,
+    diagnostics: ParserDiagnostics
+  ) => boolean;
+  onPartialText: (
+    text: string,
+    generatedFiles: Record<string, string>,
+    cleanText: string,
+    diagnostics: ParserDiagnostics
+  ) => void;
+}) {
+  const controller = new AbortController();
+  const abortFromParent = () => controller.abort();
+  if (params.signal) {
+    if (params.signal.aborted) {
+      controller.abort();
+    } else {
+      params.signal.addEventListener('abort', abortFromParent, { once: true });
+    }
+  }
+
+  const stream = streamOllamaChat(params.endpoint, params.model, params.messages, controller.signal);
+  let rawText = '';
+  let latestFiles = { ...params.baselineFiles };
+  let latestCleanText = '';
+  let latestDiagnostics: ParserDiagnostics = {
+    failedEditCount: 0,
+    failedEditFiles: [],
+    overwrittenExistingFiles: [],
+    editResults: [],
+  };
+
+  try {
+    for await (const chunk of stream) {
+      rawText += chunk;
+      const { files, cleanText, diagnostics } = parseFilesFromStream(rawText, latestFiles);
+      latestFiles = { ...latestFiles, ...files };
+      latestCleanText = `${params.messagePrefix || ''}${cleanText}`.trim();
+      latestDiagnostics = diagnostics;
+      params.onPartialText(rawText, latestFiles, latestCleanText, latestDiagnostics);
+
+      if (params.shouldStop?.(rawText, latestFiles, latestCleanText, latestDiagnostics)) {
+        controller.abort();
+        break;
+      }
+    }
+  } catch (error) {
+    if (!(error instanceof DOMException && error.name === 'AbortError')) {
+      throw error;
+    }
+  } finally {
+    params.signal?.removeEventListener('abort', abortFromParent);
+  }
+
+  return { text: rawText, files: latestFiles, cleanText: latestCleanText, diagnostics: latestDiagnostics };
+}
+
+export async function generateProjectWithOrchestration({
+  endpoint,
+  selectedModel,
+  input,
+  existingMessages,
+  existingFiles,
+  isWebSearchEnabled,
+  isMultiAgentEnabled,
+  signal,
+  onMessagesUpdate,
+  onFilesUpdate,
+  onStatusUpdate,
+}: GenerateProjectOptions): Promise<GenerateProjectResult> {
+  const executionMode = getExecutionMode(isMultiAgentEnabled);
+  let chatMessages = [...existingMessages];
+  let currentFiles = { ...existingFiles };
+  const searchContext = await runSearchIfNeeded(endpoint, selectedModel, input, isWebSearchEnabled);
+
+  onStatusUpdate({ phase: 'routing', agent: 'lead', searching: 'Lead Agent is selecting the right workflow...' });
+  const routingDecision = await routeRequestWithLeadAgent({
+    endpoint,
+    selectedModel,
+    input,
+    currentFiles,
+    executionMode,
+    signal,
+  });
+
+  const workflow = routingDecision.workflow;
+  const plannerUsed = executionMode === 'multi-agent' && routingDecision.needsPlanner;
+  let plannerNotes = '';
+  let executionBaselineFiles = { ...existingFiles };
+
+  const emptyDiagnostics: ParserDiagnostics = {
+    failedEditCount: 0,
+    failedEditFiles: [],
+    overwrittenExistingFiles: [],
+    editResults: [],
+  };
+
+  const addSearchContext = (messages: OllamaMessage[]) => (
+    searchContext
+      ? [...messages, { role: 'user' as const, content: `Supplemental research context:
+${searchContext}` }]
+      : messages
+  );
+
+  const runPlannerPhase = async () => {
+    onStatusUpdate({ phase: 'planning', agent: 'planner', searching: 'Planner Agent is drafting implementation artifacts...' });
+
+    const plannerMessages = addSearchContext([
+      {
+        role: 'system' as const,
+        content: `${SYSTEM_PROMPT}
+
+You are the Planner Agent. Before any implementation starts, create exactly three planning files using <file> tags only:
+1. implementation.md
+2. structure.md
+3. task.md
+
+implementation.md must contain these headings exactly:
+# Implementation Plan
+## App Kind
+## Goals
+## Architecture
+## Acceptance Criteria
+
+structure.md must contain these headings exactly:
+# Project Structure
+## File Tree
+## Required Files
+
+task.md must contain these headings exactly:
+# Task List
+## Execution Steps
+
+Inside task.md, write at least 3 top-level tasks using this exact pattern:
+- [ ] Task title
+  Files:
+  - [ ] \`path/to/file.ext\`
+  - [ ] \`another/file.ext\`
+  Done when: one short acceptance line
+
+Every implementation file listed in structure.md must appear under exactly one task file checklist. Do not emit any free-form explanation outside the three file tags.`,
+      },
+      ...chatMessages.filter((message) => message.role !== 'system'),
+    ]);
+
+    const plannerIndex = chatMessages.length;
+    chatMessages = [...chatMessages, { role: 'assistant', content: '' }];
+    onMessagesUpdate(chatMessages);
+
+    const plannerResult = await streamSingleAgent({
+      endpoint,
+      model: selectedModel,
+      messages: plannerMessages,
+      signal,
+      baselineFiles: currentFiles,
+      shouldStop: (rawText, generatedFiles) => shouldStopPlannerStream(rawText, keepOnlyPlannerArtifacts(generatedFiles)),
+      onPartialText: (_rawText, generatedFiles) => {
+        currentFiles = mergePlannerArtifacts(existingFiles, generatedFiles);
+        onFilesUpdate(currentFiles);
+        plannerNotes = currentFiles['implementation.md'] || '';
+        chatMessages[plannerIndex] = {
+          role: 'assistant',
+          content: getPlannerSummary(currentFiles),
+          filesGenerated: PLAN_FILES.filter((file) => file in currentFiles),
+        };
+        onMessagesUpdate([...chatMessages]);
+      },
+    });
+
+    currentFiles = mergePlannerArtifacts(existingFiles, plannerResult.files);
+    onFilesUpdate(currentFiles);
+    plannerNotes = currentFiles['implementation.md'] || '';
+    executionBaselineFiles = { ...currentFiles };
+    currentFiles = syncTaskFile(currentFiles, executionBaselineFiles);
+    onFilesUpdate(currentFiles);
+    chatMessages[plannerIndex] = {
+      role: 'assistant',
+      content: getPlannerSummary(currentFiles),
+      filesGenerated: PLAN_FILES.filter((file) => file in currentFiles),
+    };
+    onMessagesUpdate([...chatMessages]);
+  };
+
+  if (plannerUsed) {
+    await runPlannerPhase();
+  }
+
+  const buildSpec = buildSpecFromPrompt(input, currentFiles, plannerNotes);
+
+  const runBuilderPass = async (
+    builderWorkflow: WorkflowKind,
+    baselineFilesOverride?: Record<string, string>,
+    userContextOverride?: string
+  ) => {
+    onStatusUpdate({
+      phase: 'building',
+      agent: 'builder',
+      searching: builderWorkflow === 'fix'
+        ? 'Builder is applying targeted fixes to the current project...'
+        : plannerUsed
+          ? 'Builder Agent is implementing the approved scope...'
+          : 'Builder is implementing the requested changes...',
+    });
+
+    const builderMessages = addSearchContext([
+      { role: 'system' as const, content: getBuilderPrompt(buildSpec, executionMode, builderWorkflow, plannerUsed) },
+      ...chatMessages.filter((message) => message.role !== 'system'),
+      {
+        role: 'user' as const,
+        content: userContextOverride || (plannerUsed
+          ? getMultiAgentUserContext(currentFiles)
+          : builderWorkflow === 'fix'
+            ? getFixUserContext(input, currentFiles)
+            : getSingleAgentUserContext(input, currentFiles)),
+      },
+    ]);
+
+    const baselineFiles = baselineFilesOverride ?? currentFiles;
+    const builderIndex = chatMessages.length;
+    chatMessages = [...chatMessages, { role: 'assistant', content: '' }];
+    onMessagesUpdate(chatMessages);
+
+    const builderResult = await streamSingleAgent({
+      endpoint,
+      model: selectedModel,
+      messages: builderMessages,
+      signal,
+      baselineFiles: currentFiles,
+      messagePrefix: executionMode === 'multi-agent' ? '**[Builder Agent]**\n\n' : '',
+      onPartialText: (_rawText, generatedFiles, cleanText) => {
+        currentFiles = plannerUsed ? syncTaskFile(generatedFiles, executionBaselineFiles) : generatedFiles;
+        onFilesUpdate(currentFiles);
+        chatMessages[builderIndex] = {
+          role: 'assistant',
+          content: cleanText,
+          filesGenerated: getChangedFiles(baselineFiles, generatedFiles),
+        };
+        onMessagesUpdate([...chatMessages]);
+      },
+    });
+
+    currentFiles = plannerUsed ? syncTaskFile(builderResult.files, executionBaselineFiles) : builderResult.files;
+    onFilesUpdate(currentFiles);
+    return builderResult;
+  };
+
+  const runReviewerPass = async (revision: string): Promise<{ report: ReviewerReport; summary: string; revision: string }> => {
+    onStatusUpdate({
+      phase: executionMode === 'multi-agent' ? 'reviewing' : 'validating',
+      agent: executionMode === 'multi-agent' ? 'reviewer' : null,
+      searching: executionMode === 'multi-agent'
+        ? 'Reviewer Agent is checking blockers, compliance, and quality risks...'
+        : 'Inspecting the current project state...',
+    });
+
+    const reviewerMessages: OllamaMessage[] = [
+      { role: 'system', content: getReviewerPrompt(buildSpec, plannerUsed) },
+      { role: 'user', content: getReviewerUserContext(input, currentFiles, plannerUsed, revision) },
+    ];
+
+    const reviewerIndex = chatMessages.length;
+    chatMessages = [...chatMessages, { role: 'assistant', content: '' }];
+    onMessagesUpdate(chatMessages);
+
+    let reviewerReport = createEmptyReviewerReport();
+    let reviewerSummary = formatReviewerReport(reviewerReport);
+    const reviewerResult = await streamSingleAgent({
+      endpoint,
+      model: selectedModel,
+      messages: reviewerMessages,
+      signal,
+      baselineFiles: currentFiles,
+      onPartialText: (_rawText, _generatedFiles, cleanText) => {
+        const parsedReport = parseReviewerReport(cleanText);
+        if (parsedReport) {
+          reviewerReport = parsedReport;
+          reviewerSummary = formatReviewerReport(reviewerReport);
+        } else if (cleanText.trim()) {
+          reviewerSummary = executionMode === 'multi-agent'
+            ? `**[Reviewer Agent]**
+
+${cleanText.trim()}`
+            : cleanText.trim();
+        }
+
+        chatMessages[reviewerIndex] = { role: 'assistant', content: reviewerSummary };
+        onMessagesUpdate([...chatMessages]);
+      },
+    });
+
+    const parsedFinalReport = parseReviewerReport(reviewerResult.cleanText);
+    if (parsedFinalReport) {
+      reviewerReport = parsedFinalReport;
+      reviewerSummary = formatReviewerReport(reviewerReport);
+      chatMessages[reviewerIndex] = { role: 'assistant', content: reviewerSummary };
+      onMessagesUpdate([...chatMessages]);
+    }
+
+    return { report: reviewerReport, summary: reviewerSummary, revision };
+  };
+
+  const runBoundReviewerValidation = async (
+    diagnostics: ParserDiagnostics,
+    phase: 'builder' | 'fixer'
+  ): Promise<{ report: ReviewerReport; summary: string; gateResults: GateResult[]; revision: string }> => {
+    const revision = getFilesRevision(currentFiles);
+    const { report, summary } = await runReviewerPass(revision);
+
+    onStatusUpdate({
+      phase: 'validating',
+      agent: executionMode === 'multi-agent' ? 'reviewer' : null,
+      searching: 'Running blocker, compliance, and quality gates...',
+    });
+
+    let gateResults = await runExecutionGates(currentFiles, buildSpec, executionMode, diagnostics, phase, plannerUsed);
+    if (executionMode === 'multi-agent') {
+      gateResults = dedupeGateResults([...gateResults, ...createReviewerDerivedGates(report)]);
+    }
+
+    return { report, summary, gateResults, revision };
+  };
+
+  const finalizeResult = async (gateResults: GateResult[], reviewerSummary: string, attemptCount: number) => {
+    const summary = summarizeGateResults(buildSpec, gateResults, reviewerSummary, attemptCount, {
+      executionMode,
+      workflow,
+      plannerUsed,
+      planArtifactsCreated: plannerUsed,
+    });
+
+    onStatusUpdate({
+      phase: gateResults.some((gate) => gate.status === 'fail') ? 'failed' : 'completed',
+      agent: null,
+      searching: false,
+    });
+
+    return { messages: chatMessages, files: currentFiles, gateResults, summary, buildSpec };
+  };
+
+  const runReviewAndFixLoop = async (initialDiagnostics: ParserDiagnostics) => {
+    let {
+      report: reviewerReport,
+      summary: reviewerSummary,
+      gateResults,
+      revision: reviewedRevision,
+    } = await runBoundReviewerValidation(initialDiagnostics, 'builder');
+    let attemptCount = 0;
+
+    if (executionMode !== 'multi-agent' || workflow === 'review' || workflow === 'inspect') {
+      return finalizeResult(gateResults, reviewerSummary, attemptCount);
+    }
+
+    while (gateResults.some((gate) => gate.status === 'fail') && attemptCount < MAX_FIX_ATTEMPTS) {
+      attemptCount += 1;
+      onStatusUpdate({
+        phase: 'fixing',
+        agent: 'fixer',
+        searching: `Fixer Agent is resolving prioritized failures (attempt ${attemptCount}/${MAX_FIX_ATTEMPTS})...`,
+      });
+
+      const fixInstructions = getFailedGateSummary(gateResults);
+      const failedGateFiles = getFailedGateAffectedFiles(gateResults);
+      const nonPlanFailurePresent = hasNonPlanFailures(gateResults);
+      const fixerBaselineFiles = { ...currentFiles };
+      const baselineRevision = reviewedRevision;
+
+      const fixerPromptContext = plannerUsed
+        ? `Reviewed workspace revision: ${baselineRevision}
+
+Approved plan artifacts:
+
+${getPlanContext(currentFiles)}
+
+`
+        : `Reviewed workspace revision: ${baselineRevision}
+
+`;
+
+      const fixerMessages: OllamaMessage[] = [
+        { role: 'system', content: getFixerPrompt(buildSpec) },
+        {
+          role: 'user',
+          content: `${fixerPromptContext}Original user request:
+${input}
+
+Reviewer report:
+${JSON.stringify(reviewerReport, null, 2)}
+
+Reviewer summary:
+${reviewerSummary || 'No reviewer summary available.'}
+
+Failed gates:
+${fixInstructions}
+
+Failing scope files: ${failedGateFiles.length > 0 ? failedGateFiles.join(', ') : 'none provided'}
+Blocking failures present: ${hasBlockingFailures(gateResults) ? 'yes' : 'no'}
+Non-plan failures still present: ${nonPlanFailurePresent ? 'yes' : 'no'}
+
+Current files:
+${JSON.stringify(currentFiles)}
+
+Apply the smallest concrete repair set needed for the failing scope. If blocker or non-plan failures are present, do not spend this attempt only on task.md, structure.md, or implementation.md.`,
+        },
+      ];
+
+      const fixerIndex = chatMessages.length;
+      chatMessages = [...chatMessages, { role: 'assistant', content: '' }];
+      onMessagesUpdate(chatMessages);
+
+      const fixerResult = await streamSingleAgent({
+        endpoint,
+        model: selectedModel,
+        messages: fixerMessages,
+        signal,
+        baselineFiles: currentFiles,
+        messagePrefix: '**[Fixer Agent]**\n\n',
+        onPartialText: (_rawText, generatedFiles, cleanText) => {
+          currentFiles = plannerUsed ? syncTaskFile(generatedFiles, executionBaselineFiles) : generatedFiles;
+          onFilesUpdate(currentFiles);
+          chatMessages[fixerIndex] = {
+            role: 'assistant',
+            content: cleanText,
+            filesGenerated: getChangedFiles(fixerBaselineFiles, currentFiles),
+          };
+          onMessagesUpdate([...chatMessages]);
+        },
+      });
+
+      currentFiles = plannerUsed ? syncTaskFile(fixerResult.files, executionBaselineFiles) : fixerResult.files;
+      onFilesUpdate(currentFiles);
+      const fixerChangedFiles = getChangedFiles(fixerBaselineFiles, currentFiles);
+      const nonPlanChangedFiles = getNonPlanChangedFiles(fixerBaselineFiles, currentFiles);
+      const currentRevision = getFilesRevision(currentFiles);
+
+      if (fixerChangedFiles.length === 0 && gateResults.some((gate) => gate.status === 'fail')) {
+        gateResults = [...gateResults, createNoOpFixerGate(attemptCount)];
+        break;
+      }
+
+      onStatusUpdate({ phase: 'reviewing', agent: 'reviewer', searching: 'Reviewer Agent is validating the fixer output...' });
+      ({
+        report: reviewerReport,
+        summary: reviewerSummary,
+        gateResults,
+        revision: reviewedRevision,
+      } = await runBoundReviewerValidation(fixerResult.diagnostics, 'fixer'));
+
+      if (currentRevision !== reviewedRevision) {
+        gateResults = dedupeGateResults([
+          ...gateResults,
+          {
+            id: `review-stale-${attemptCount}`,
+            status: 'fail',
+            priority: 'blocker',
+            scope: 'universal',
+            title: 'Reviewer snapshot became stale during validation',
+            message: `The reviewed revision (${reviewedRevision}) did not match the latest file revision (${currentRevision}). The loop will stop to avoid applying stale fixes.`,
+            affectedFiles: [],
+            autoFixHint: 'Re-run the review on the latest workspace snapshot before applying more edits.',
+          },
+        ]);
+        break;
+      }
+
+      if (nonPlanChangedFiles.length === 0 && fixerChangedFiles.length > 0 && (hasNonPlanFailures(gateResults) || hasBlockingFailures(gateResults))) {
+        gateResults = [...gateResults, createPaperworkOnlyFixerGate(attemptCount, fixerChangedFiles)];
+        break;
+      }
+    }
+
+    return finalizeResult(gateResults, reviewerSummary, attemptCount);
+  };
+
+  if (workflow === 'build' || workflow === 'rebuild') {
+    const builderResult = await runBuilderPass(workflow, currentFiles);
+
+    if (executionMode === 'single-agent') {
+      onStatusUpdate({ phase: 'validating', agent: null, searching: 'Running quality gates...' });
+      const gateResults = await runExecutionGates(currentFiles, buildSpec, executionMode, builderResult.diagnostics, 'builder', plannerUsed);
+      return finalizeResult(gateResults, '', 0);
+    }
+
+    return runReviewAndFixLoop(builderResult.diagnostics);
+  }
+
+  if (workflow === 'fix' && executionMode === 'single-agent') {
+    const builderResult = await runBuilderPass('fix', currentFiles);
+    onStatusUpdate({ phase: 'validating', agent: null, searching: 'Running quality gates...' });
+    let gateResults = await runExecutionGates(currentFiles, buildSpec, executionMode, builderResult.diagnostics, 'builder', plannerUsed);
+
+    if (gateResults.some((gate) => gate.status === 'fail')) {
+      const retryContext = `Original user request:
+${input}
+
+Failed gates:
+${getFailedGateSummary(gateResults)}
+
+Current files:
+${JSON.stringify(currentFiles)}
+
+Repair only the listed failures with targeted <file> or <edit> changes.`;
+      const retryResult = await runBuilderPass('fix', currentFiles, retryContext);
+      onStatusUpdate({ phase: 'validating', agent: null, searching: 'Re-running quality gates after fix retry...' });
+      gateResults = await runExecutionGates(currentFiles, buildSpec, executionMode, retryResult.diagnostics, 'fixer', plannerUsed);
+    }
+
+    return finalizeResult(gateResults, '', gateResults.some((gate) => gate.status === 'fail') ? 1 : 0);
+  }
+
+  return runReviewAndFixLoop(emptyDiagnostics);
+}
