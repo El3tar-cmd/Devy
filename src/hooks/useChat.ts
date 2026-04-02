@@ -390,6 +390,10 @@ export function useChat({
       return;
     }
 
+    if (!shouldAttemptRuntimeAutoFix(currentSummary)) {
+      return;
+    }
+
     const runtimeGates = createRuntimeGateResults(result);
     const mergedGateResults = mergeRuntimeGateResults(gateResultsRef.current, runtimeGates);
     const nextSummary = patchGenerationSummary(currentSummary, mergedGateResults, result);
