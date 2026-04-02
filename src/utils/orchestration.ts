@@ -47,11 +47,12 @@ interface GenerateProjectResult {
 interface TaskBlock {
   taskLineIndex: number;
   title: string;
+  assignedAgent?: string;
   fileLines: Array<{ index: number; path: string }>;
 }
 
 const MAX_FIX_ATTEMPTS = 2;
-const PLAN_FILES = ['implementation.md', 'structure.md', 'task.md'] as const;
+const PLAN_FILES = ['plan.md', 'structure.md', 'task.md'] as const;
 
 function keepOnlyPlannerArtifacts(files: Record<string, string>) {
   return Object.fromEntries(
@@ -88,7 +89,7 @@ function getPlannerSummary(files: Record<string, string>) {
 
 function getPlanContext(files: Record<string, string>) {
   return [
-    `implementation.md:\n${files['implementation.md'] || 'Missing'}`,
+    `plan.md:\n${files['plan.md'] || 'Missing'}`,
     `structure.md:\n${files['structure.md'] || 'Missing'}`,
     `task.md:\n${files['task.md'] || 'Missing'}`,
   ].join('\n\n');
@@ -119,6 +120,11 @@ function parseTaskBlocks(taskContent: string) {
     for (let j = i + 1; j < lines.length; j += 1) {
       const line = lines[j];
       if (isTaskLine(line) || isHeadingLine(line)) break;
+
+      const agentMatch = line.match(/^\s*Assigned Agent:\s*(.+)$/i);
+      if (agentMatch) {
+        block.assignedAgent = agentMatch[1].trim();
+      }
 
       const fileMatch = line.match(/^\s*- \[[ xX~]\] `([^`]+)`/);
       if (fileMatch) {
@@ -241,7 +247,7 @@ function getExecutionMode(isMultiAgentEnabled: boolean): ExecutionMode {
 
 const SHARED_AGENT_RULES = `Use <file> and <edit> tags only. Never answer with markdown code fences. Prefer minimal, targeted edits when changing existing projects. Preserve unrelated working files unless a directly related change is required.`;
 
-function getBuilderPrompt(spec: BuildSpec, executionMode: ExecutionMode, workflow: WorkflowKind, plannerUsed: boolean) {
+function getExecutionAgentPrompt(spec: BuildSpec, executionMode: ExecutionMode, workflow: WorkflowKind, plannerUsed: boolean, agentName: string = 'Builder') {
   const modeInstructions = plannerUsed
     ? 'The approved planning artifacts are the source of truth. Follow them closely, but still preserve unrelated working files.'
     : workflow === 'fix'
@@ -252,7 +258,7 @@ function getBuilderPrompt(spec: BuildSpec, executionMode: ExecutionMode, workflo
 
   return `${SYSTEM_PROMPT}
 
-You are the Builder Agent. ${modeInstructions}
+You are the ${agentName} Agent. ${modeInstructions}
 
 Execution mode: ${executionMode}
 Workflow: ${workflow}
@@ -269,7 +275,7 @@ ${SHARED_AGENT_RULES}`;
 
 function getReviewerPrompt(spec: BuildSpec, plannerUsed: boolean) {
   const scopeInstructions = plannerUsed
-    ? 'Review the generated result against implementation.md, structure.md, and task.md.'
+    ? 'Review the generated result against plan.md, structure.md, and task.md.'
     : 'Review the current project against the user request and the existing files only. Do not ask for planning artifacts and do not assume they should exist.';
 
   return `${SYSTEM_PROMPT}
@@ -811,15 +817,16 @@ ${searchContext}` }]
         content: `${SYSTEM_PROMPT}
 
 You are the Planner Agent. Before any implementation starts, create exactly three planning files using <file> tags only:
-1. implementation.md
+1. plan.md
 2. structure.md
 3. task.md
 
-implementation.md must contain these headings exactly:
+plan.md must contain these headings exactly:
 # Implementation Plan
 ## App Kind
 ## Goals
 ## Architecture
+## Required Agents (Choose from: Frontend, Backend, Database, Documentation)
 ## Acceptance Criteria
 
 structure.md must contain these headings exactly:
@@ -833,6 +840,7 @@ task.md must contain these headings exactly:
 
 Inside task.md, write at least 3 top-level tasks using this exact pattern:
 - [ ] Task title
+  Assigned Agent: [Agent Name]
   Files:
   - [ ] \`path/to/file.ext\`
   - [ ] \`another/file.ext\`
@@ -857,7 +865,7 @@ Every implementation file listed in structure.md must appear under exactly one t
       onPartialText: (_rawText, generatedFiles) => {
         currentFiles = mergePlannerArtifacts(existingFiles, generatedFiles);
         onFilesUpdate(currentFiles);
-        plannerNotes = currentFiles['implementation.md'] || '';
+        plannerNotes = currentFiles['plan.md'] || '';
         chatMessages[plannerIndex] = {
           role: 'assistant',
           content: getPlannerSummary(currentFiles),
@@ -869,7 +877,7 @@ Every implementation file listed in structure.md must appear under exactly one t
 
     currentFiles = mergePlannerArtifacts(existingFiles, plannerResult.files);
     onFilesUpdate(currentFiles);
-    plannerNotes = currentFiles['implementation.md'] || '';
+    plannerNotes = currentFiles['plan.md'] || '';
     executionBaselineFiles = { ...currentFiles };
     currentFiles = syncTaskFile(currentFiles, executionBaselineFiles);
     onFilesUpdate(currentFiles);
@@ -887,61 +895,139 @@ Every implementation file listed in structure.md must appear under exactly one t
 
   const buildSpec = buildSpecFromPrompt(input, currentFiles, plannerNotes);
 
-  const runBuilderPass = async (
+  const runExecutionPass = async (
     builderWorkflow: WorkflowKind,
     baselineFilesOverride?: Record<string, string>,
     userContextOverride?: string
   ) => {
-    onStatusUpdate({
-      phase: 'building',
-      agent: 'builder',
-      searching: builderWorkflow === 'fix'
-        ? 'Builder is applying targeted fixes to the current project...'
-        : plannerUsed
-          ? 'Builder Agent is implementing the approved scope...'
-          : 'Builder is implementing the requested changes...',
-    });
+    let finalDiagnostics: ParserDiagnostics = {
+      failedEditCount: 0,
+      failedEditFiles: [],
+      overwrittenExistingFiles: [],
+      editResults: [],
+    };
 
-    const builderMessages = addSearchContext([
-      { role: 'system' as const, content: getBuilderPrompt(buildSpec, executionMode, builderWorkflow, plannerUsed) },
-      ...chatMessages.filter((message) => message.role !== 'system'),
-      {
-        role: 'user' as const,
-        content: userContextOverride || (plannerUsed
-          ? getMultiAgentUserContext(currentFiles)
-          : builderWorkflow === 'fix'
-            ? getFixUserContext(input, currentFiles)
-            : getSingleAgentUserContext(input, currentFiles)),
-      },
-    ]);
+    if (plannerUsed) {
+      const taskContent = currentFiles['task.md'] || '';
+      const { blocks } = parseTaskBlocks(taskContent);
 
-    const baselineFiles = baselineFilesOverride ?? currentFiles;
-    const builderIndex = chatMessages.length;
-    chatMessages = [...chatMessages, { role: 'assistant', content: '' }];
-    onMessagesUpdate(chatMessages);
+      for (const block of blocks) {
+        // Check if task is already completed based on file changes
+        let changedCount = 0;
+        for (const fileLine of block.fileLines) {
+          if (hasFileChanged(fileLine.path, executionBaselineFiles, currentFiles)) {
+            changedCount += 1;
+          }
+        }
+        
+        if (block.fileLines.length > 0 && changedCount === block.fileLines.length) {
+          continue; // Task already completed
+        }
 
-    const builderResult = await streamSingleAgent({
-      endpoint,
-      model: selectedModel,
-      messages: builderMessages,
-      signal,
-      baselineFiles: currentFiles,
-      messagePrefix: executionMode === 'multi-agent' ? '**[Builder Agent]**\n\n' : '',
-      onPartialText: (_rawText, generatedFiles, cleanText) => {
-        currentFiles = plannerUsed ? syncTaskFile(generatedFiles, executionBaselineFiles) : generatedFiles;
+        const agentName = block.assignedAgent || 'Builder';
+        const agentId = agentName.toLowerCase() as GenerationAgent;
+
+        onStatusUpdate({
+          phase: 'building',
+          agent: agentId,
+          searching: `Lead Agent assigned task "${block.title}" to ${agentName} Agent...`,
+        });
+
+        const executionMessages = addSearchContext([
+          { role: 'system' as const, content: getExecutionAgentPrompt(buildSpec, executionMode, builderWorkflow, plannerUsed, agentName) },
+          ...chatMessages.filter((message) => message.role !== 'system'),
+          {
+            role: 'user' as const,
+            content: `Task to execute: ${block.title}
+Assigned Agent: ${agentName}
+
+${getMultiAgentUserContext(currentFiles)}`,
+          },
+        ]);
+
+        const baselineFiles = baselineFilesOverride ?? currentFiles;
+        const executionIndex = chatMessages.length;
+        chatMessages = [...chatMessages, { role: 'assistant', content: '' }];
+        onMessagesUpdate(chatMessages);
+
+        const executionResult = await streamSingleAgent({
+          endpoint,
+          model: selectedModel,
+          messages: executionMessages,
+          signal,
+          baselineFiles: currentFiles,
+          messagePrefix: `**[${agentName} Agent]**\n\nExecuting: ${block.title}\n\n`,
+          onPartialText: (_rawText, generatedFiles, cleanText) => {
+            currentFiles = syncTaskFile(generatedFiles, executionBaselineFiles);
+            onFilesUpdate(currentFiles);
+            chatMessages[executionIndex] = {
+              role: 'assistant',
+              content: cleanText,
+              filesGenerated: getChangedFiles(baselineFiles, generatedFiles),
+            };
+            onMessagesUpdate([...chatMessages]);
+          },
+        });
+
+        currentFiles = syncTaskFile(executionResult.files, executionBaselineFiles);
         onFilesUpdate(currentFiles);
-        chatMessages[builderIndex] = {
-          role: 'assistant',
-          content: cleanText,
-          filesGenerated: getChangedFiles(baselineFiles, generatedFiles),
-        };
-        onMessagesUpdate([...chatMessages]);
-      },
-    });
+        
+        // Merge diagnostics
+        finalDiagnostics.failedEditCount += executionResult.diagnostics.failedEditCount;
+        finalDiagnostics.failedEditFiles.push(...executionResult.diagnostics.failedEditFiles);
+        finalDiagnostics.overwrittenExistingFiles.push(...executionResult.diagnostics.overwrittenExistingFiles);
+        finalDiagnostics.editResults.push(...executionResult.diagnostics.editResults);
+      }
+      
+      return { files: currentFiles, diagnostics: finalDiagnostics };
+    } else {
+      onStatusUpdate({
+        phase: 'building',
+        agent: 'builder',
+        searching: builderWorkflow === 'fix'
+          ? 'Builder is applying targeted fixes to the current project...'
+          : 'Builder is implementing the requested changes...',
+      });
 
-    currentFiles = plannerUsed ? syncTaskFile(builderResult.files, executionBaselineFiles) : builderResult.files;
-    onFilesUpdate(currentFiles);
-    return builderResult;
+      const builderMessages = addSearchContext([
+        { role: 'system' as const, content: getExecutionAgentPrompt(buildSpec, executionMode, builderWorkflow, plannerUsed) },
+        ...chatMessages.filter((message) => message.role !== 'system'),
+        {
+          role: 'user' as const,
+          content: userContextOverride || (builderWorkflow === 'fix'
+              ? getFixUserContext(input, currentFiles)
+              : getSingleAgentUserContext(input, currentFiles)),
+        },
+      ]);
+
+      const baselineFiles = baselineFilesOverride ?? currentFiles;
+      const builderIndex = chatMessages.length;
+      chatMessages = [...chatMessages, { role: 'assistant', content: '' }];
+      onMessagesUpdate(chatMessages);
+
+      const builderResult = await streamSingleAgent({
+        endpoint,
+        model: selectedModel,
+        messages: builderMessages,
+        signal,
+        baselineFiles: currentFiles,
+        messagePrefix: executionMode === 'multi-agent' ? '**[Builder Agent]**\n\n' : '',
+        onPartialText: (_rawText, generatedFiles, cleanText) => {
+          currentFiles = generatedFiles;
+          onFilesUpdate(currentFiles);
+          chatMessages[builderIndex] = {
+            role: 'assistant',
+            content: cleanText,
+            filesGenerated: getChangedFiles(baselineFiles, generatedFiles),
+          };
+          onMessagesUpdate([...chatMessages]);
+        },
+      });
+
+      currentFiles = builderResult.files;
+      onFilesUpdate(currentFiles);
+      return builderResult;
+    }
   };
 
   const runReviewerPass = async (revision: string): Promise<{ report: ReviewerReport; summary: string; revision: string }> => {
@@ -1052,10 +1138,44 @@ ${cleanText.trim()}`
 
     while (gateResults.some((gate) => gate.status === 'fail') && attemptCount < MAX_FIX_ATTEMPTS) {
       attemptCount += 1;
+      
+      onStatusUpdate({
+        phase: 'routing',
+        agent: 'lead',
+        searching: `Lead Agent is determining the responsible agent for fixes (attempt ${attemptCount}/${MAX_FIX_ATTEMPTS})...`,
+      });
+
+      // Ask Lead Agent who should fix this
+      let assignedFixer = 'Fixer';
+      try {
+        const leadResponse = await fetch(`${endpoint.replace(/\/$/, '')}/api/generate`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            model: selectedModel,
+            prompt: `You are the Lead Agent. A reviewer found errors in the project. Based on the reviewer report, which agent should fix these errors? Choose exactly one from: Frontend, Backend, Database, Documentation, Fixer.\n\nReviewer Report:\n${JSON.stringify(reviewerReport, null, 2)}\n\nOutput only the agent name.`,
+            stream: false,
+            options: { temperature: 0.1, num_predict: 20 },
+          }),
+          signal,
+        });
+        if (leadResponse.ok) {
+          const data = await leadResponse.json();
+          if (typeof data.response === 'string' && data.response.trim()) {
+            const agent = data.response.trim().replace(/[^a-zA-Z]/g, '');
+            if (['Frontend', 'Backend', 'Database', 'Documentation', 'Fixer'].includes(agent)) {
+              assignedFixer = agent;
+            }
+          }
+        }
+      } catch (e) {
+        // Fallback to Fixer
+      }
+
       onStatusUpdate({
         phase: 'fixing',
-        agent: 'fixer',
-        searching: `Fixer Agent is resolving prioritized failures (attempt ${attemptCount}/${MAX_FIX_ATTEMPTS})...`,
+        agent: assignedFixer.toLowerCase() as GenerationAgent,
+        searching: `Lead Agent assigned fixes to ${assignedFixer} Agent (attempt ${attemptCount}/${MAX_FIX_ATTEMPTS})...`,
       });
 
       const fixInstructions = getFailedGateSummary(gateResults);
@@ -1077,7 +1197,7 @@ ${getPlanContext(currentFiles)}
 `;
 
       const fixerMessages: OllamaMessage[] = [
-        { role: 'system', content: getFixerPrompt(buildSpec) },
+        { role: 'system', content: getExecutionAgentPrompt(buildSpec, executionMode, 'fix', plannerUsed, assignedFixer) },
         {
           role: 'user',
           content: `${fixerPromptContext}Original user request:
@@ -1099,7 +1219,7 @@ Non-plan failures still present: ${nonPlanFailurePresent ? 'yes' : 'no'}
 Current files:
 ${JSON.stringify(currentFiles)}
 
-Apply the smallest concrete repair set needed for the failing scope. If blocker or non-plan failures are present, do not spend this attempt only on task.md, structure.md, or implementation.md.`,
+Apply the smallest concrete repair set needed for the failing scope. If blocker or non-plan failures are present, do not spend this attempt only on task.md, structure.md, or plan.md.`,
         },
       ];
 
@@ -1113,7 +1233,7 @@ Apply the smallest concrete repair set needed for the failing scope. If blocker 
         messages: fixerMessages,
         signal,
         baselineFiles: currentFiles,
-        messagePrefix: '**[Fixer Agent]**\n\n',
+        messagePrefix: `**[${assignedFixer} Agent]**\n\n`,
         onPartialText: (_rawText, generatedFiles, cleanText) => {
           currentFiles = plannerUsed ? syncTaskFile(generatedFiles, executionBaselineFiles) : generatedFiles;
           onFilesUpdate(currentFiles);
@@ -1172,7 +1292,7 @@ Apply the smallest concrete repair set needed for the failing scope. If blocker 
   };
 
   if (workflow === 'build' || workflow === 'rebuild') {
-    const builderResult = await runBuilderPass(workflow, currentFiles);
+    const builderResult = await runExecutionPass(workflow, currentFiles);
 
     if (executionMode === 'single-agent') {
       onStatusUpdate({ phase: 'validating', agent: null, searching: 'Running quality gates...' });
@@ -1184,7 +1304,7 @@ Apply the smallest concrete repair set needed for the failing scope. If blocker 
   }
 
   if (workflow === 'fix' && executionMode === 'single-agent') {
-    const builderResult = await runBuilderPass('fix', currentFiles);
+    const builderResult = await runExecutionPass('fix', currentFiles);
     onStatusUpdate({ phase: 'validating', agent: null, searching: 'Running quality gates...' });
     let gateResults = await runExecutionGates(currentFiles, buildSpec, executionMode, builderResult.diagnostics, 'builder', plannerUsed);
 
@@ -1199,7 +1319,7 @@ Current files:
 ${JSON.stringify(currentFiles)}
 
 Repair only the listed failures with targeted <file> or <edit> changes.`;
-      const retryResult = await runBuilderPass('fix', currentFiles, retryContext);
+      const retryResult = await runExecutionPass('fix', currentFiles, retryContext);
       onStatusUpdate({ phase: 'validating', agent: null, searching: 'Re-running quality gates after fix retry...' });
       gateResults = await runExecutionGates(currentFiles, buildSpec, executionMode, retryResult.diagnostics, 'fixer', plannerUsed);
     }

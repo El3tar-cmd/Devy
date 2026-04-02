@@ -26,6 +26,7 @@ interface UseChatOptions {
 interface RunGenerationOptions {
   promptText: string;
   images?: string[];
+  injectedFiles?: Record<string, string>;
   projectName: string;
   allowRuntimeAutoFix: boolean;
   clearComposerAfterStart?: boolean;
@@ -37,15 +38,29 @@ function buildGenerationInput(input: string, attachments: Attachment[]) {
   const imageAttachments = attachments.filter((attachment) => !attachment.isText);
   const textAttachments = attachments.filter((attachment) => attachment.isText);
 
-  const promptText = textAttachments.length > 0
+  let promptText = textAttachments.length > 0
     ? `${input}${textAttachments
         .map((attachment) => `\n\n--- FILE: ${attachment.name} ---\n${attachment.textContent || ''}\n--- END FILE ---`)
         .join('')}`
     : input;
 
+  const injectedFiles: Record<string, string> = {};
+  if (imageAttachments.length > 0) {
+    const imagePaths: string[] = [];
+    imageAttachments.forEach((attachment, index) => {
+      const fileName = attachment.name || `image_${index}.png`;
+      const filePath = `public/${fileName}`;
+      injectedFiles[filePath] = attachment.url; // Store dataUrl (which includes data:image/...;base64,)
+      imagePaths.push(filePath);
+    });
+    
+    promptText += `\n\n[Note: The user has uploaded the following images which are now available in the project. You can reference them directly in your code (e.g., <img src="/${imagePaths[0].replace('public/', '')}" />):\n${imagePaths.map(p => `- ${p}`).join('\n')}]`;
+  }
+
   return {
     promptText,
     imageAttachments,
+    injectedFiles,
   };
 }
 
@@ -217,6 +232,7 @@ export function useChat({
   const runGeneration = useCallback(async ({
     promptText,
     images = [],
+    injectedFiles = {},
     projectName,
     allowRuntimeAutoFix,
     clearComposerAfterStart = false,
@@ -224,7 +240,7 @@ export function useChat({
     if (!promptText.trim() || !selectedModel) return;
 
     const baseMessages = liveMessagesRef.current.length > 0 ? liveMessagesRef.current : messages;
-    const baseFiles = liveFilesRef.current;
+    const baseFiles = { ...liveFilesRef.current, ...injectedFiles };
     const userMsg: OllamaMessage = {
       role: 'user',
       content: promptText,
@@ -324,7 +340,7 @@ export function useChat({
     if (!input.trim() && attachments.length === 0) return;
     if (!selectedModel) return;
 
-    const { promptText, imageAttachments } = buildGenerationInput(input, attachments);
+    const { promptText, imageAttachments, injectedFiles } = buildGenerationInput(input, attachments);
     const isFirstMessage = messages.length === 1 && messages[0].role === 'system';
     let newProjectName = currentProjectName;
     if (isFirstMessage) {
@@ -337,6 +353,7 @@ export function useChat({
     await runGeneration({
       promptText,
       images: imageAttachments.map((attachment) => attachment.base64),
+      injectedFiles,
       projectName: newProjectName,
       allowRuntimeAutoFix: true,
       clearComposerAfterStart: true,

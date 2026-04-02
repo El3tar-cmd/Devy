@@ -74,7 +74,18 @@ function buildFileSystemTree(files: Record<string, string>) {
     for (let i = 0; i < parts.length; i += 1) {
       const part = parts[i];
       if (i === parts.length - 1) {
-        current[part] = { file: { contents: content } };
+        // Check if it's a base64 encoded image
+        if (content.startsWith('data:image/') && content.includes('base64,')) {
+          const base64Data = content.split('base64,')[1];
+          const binaryString = atob(base64Data);
+          const bytes = new Uint8Array(binaryString.length);
+          for (let j = 0; j < binaryString.length; j++) {
+            bytes[j] = binaryString.charCodeAt(j);
+          }
+          current[part] = { file: { contents: bytes } };
+        } else {
+          current[part] = { file: { contents: content } };
+        }
       } else {
         if (!current[part]) {
           current[part] = { directory: {} };
